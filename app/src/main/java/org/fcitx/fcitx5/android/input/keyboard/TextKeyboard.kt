@@ -8,6 +8,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.res.ColorStateList
 import android.graphics.drawable.Drawable
+import android.util.Log
 import android.view.View
 import android.widget.ImageView
 import androidx.annotation.Keep
@@ -149,6 +150,7 @@ class TextKeyboard(
             numericOverride.force(layoutKey)
             val normalized = numericOverride.forcedKey
             if (forcedLayoutKey == normalized) return
+            Log.d("FcitxKbd", "forcedLayout -> $normalized (was $forcedLayoutKey)")
             forcedLayoutKey = normalized
             forEachAttachedKeyboard { keyboard ->
                 keyboard.refreshStyle()
@@ -162,14 +164,38 @@ class TextKeyboard(
 
         @Synchronized
         fun activateManualNumericLayout(layoutKey: String): Boolean {
-            val wasActive = numericOverride.activateManual(layoutKey)
+            if (!numericOverride.activateManual(layoutKey)) {
+                Log.d("FcitxKbd", "activateManual ignored key=$layoutKey dismissed=true")
+                return false
+            }
+            Log.d("FcitxKbd", "activateManual key=$layoutKey")
             setForcedLayoutKey(layoutKey)
-            return wasActive
+            return true
         }
 
         @Synchronized
         fun releaseManualNumericLayout(): Boolean {
             if (!numericOverride.releaseManual()) return false
+            Log.d("FcitxKbd", "releaseManual")
+            setForcedLayoutKey(null)
+            return true
+        }
+
+        /**
+         * Release ONLY the manually activated numeric layout because the input method
+         * changed (language switch). Called from [KeyboardWindow.onImeUpdate] BEFORE the
+         * layer latches are cleared; otherwise the forced-layout fallback would resurrect
+         * the remembered manual key over the newly selected keyboard ("switching
+         * Chinese/English lands on the number pad", regression introduced by bc82c97e).
+         * Session-based overrides for numeric editors are preserved and still survive
+         * IME updates while their editor stays numeric.
+         *
+         * @return whether a manual override was actually released.
+         */
+        @Synchronized
+        fun releaseManualNumericLayoutOnImeUpdate(): Boolean {
+            if (!numericOverride.releaseManualOnImeUpdate()) return false
+            Log.d("FcitxKbd", "onImeUpdate released manual numeric layout")
             setForcedLayoutKey(null)
             return true
         }
@@ -183,8 +209,12 @@ class TextKeyboard(
         @Synchronized
         fun setNumericLayoutKey(layoutKey: String?) {
             val normalized = layoutKey?.trim()?.takeIf { it.isNotEmpty() }
-            if (numericOverride.sessionKey == normalized && forcedLayoutKey == normalized) return
+            if (numericOverride.sessionKey == normalized &&
+                forcedLayoutKey == normalized &&
+                !numericOverride.dismissed
+            ) return
             numericOverride.beginSession(normalized)
+            Log.d("FcitxKbd", "setNumericLayoutKey key=$normalized")
             // Latched layers were just cleared by the caller; the forced slot now carries
             // the numeric layout and keeps falling back to it for the rest of the session.
             forcedLayoutKey = normalized
@@ -211,6 +241,10 @@ class TextKeyboard(
         @Synchronized
         fun isNumericLayoutActive(): Boolean = numericOverride.sessionKey != null
 
+        @Synchronized
+        fun isNumericLayoutShowing(): Boolean =
+            numericOverride.sessionKey != null || numericOverride.manualKey != null
+
         /**
          * Release the numeric-input layout override for the rest of the current session,
          * clearing both the session slot and the forced slot. Used when the user explicitly
@@ -222,6 +256,7 @@ class TextKeyboard(
         @Synchronized
         fun dismissNumericLayoutOverride() {
             if (numericOverride.sessionKey == null && forcedLayoutKey == null) return
+            Log.d("FcitxKbd", "dismissNumericLayoutOverride")
             numericOverride.dismiss()
             forcedLayoutKey = null
             forEachAttachedKeyboard { keyboard ->
@@ -263,12 +298,14 @@ class TextKeyboard(
          */
         @Synchronized
         fun revalidateNumericLayoutOverride(): Boolean {
-            val current = numericOverride.sessionKey ?: return false
-            val resolved = resolveNumericLayoutKey()
-            if (resolved == current) return false
-            val dropped = numericOverride.revalidate(resolved)
-            if (forcedLayoutKey == current) forcedLayoutKey = numericOverride.forcedKey
-            return dropped
+            val sessionDropped = numericOverride.revalidateSession(resolveNumericLayoutKey())
+            val manualDropped = numericOverride.manualKey?.let { manualKey ->
+                numericOverride.revalidateManual(textLayoutJson?.let { containsLayoutKey(it, manualKey) } == true)
+            } ?: false
+            if (forcedLayoutKey != numericOverride.forcedKey) {
+                forcedLayoutKey = numericOverride.forcedKey
+            }
+            return sessionDropped || manualDropped
         }
 
         @Synchronized

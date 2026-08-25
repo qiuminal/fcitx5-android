@@ -283,9 +283,8 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
         // normal text keyboard.
         if (target == NumberKeyboard.Name) {
             val override = TextKeyboard.resolveNumericLayoutKey()
-            if (override != null) {
+            if (override != null && TextKeyboard.activateManualNumericLayout(override)) {
                 target = TextKeyboard.Name
-                TextKeyboard.activateManualNumericLayout(override)
             }
         } else if (target == TextKeyboard.Name && fromUserKey) {
             // An explicit user key targeting the text keyboard (e.g. an "ABC"-style
@@ -307,6 +306,10 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
         // onStartInput) must NOT release the manual numeric layout here: the layer latch
         // was applied moments before via applyEffectiveTextLayer and releasing would
         // clobber it back to the session fallback.
+        Log.d(
+            "FcitxKbd",
+            "switchLayout requested=$requestedTarget target=$target fromUserKey=$fromUserKey"
+        )
         ContextCompat.getMainExecutor(service).execute {
             if (target == TextKeyboard.Name || target == NumberKeyboard.Name) {
                 if (target == TextKeyboard.Name) {
@@ -502,6 +505,16 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     }
 
     override fun onImeUpdate(ime: InputMethodEntry) {
+        // An input-method / language switch is an explicit user move away from whatever
+        // the keyboard showed. Drop a manually activated numeric layout BEFORE clearing
+        // the layer latches, otherwise the forced-layout fallback below resurrects it
+        // over the newly selected keyboard ("switching Chinese/English lands on the
+        // number pad"). Session-based overrides for numeric editors are preserved.
+        val releasedManual = TextKeyboard.releaseManualNumericLayoutOnImeUpdate()
+        Log.d(
+            "FcitxKbd",
+            "onImeUpdate ime=${ime.uniqueName} subMode=${ime.subMode.label} releasedManual=$releasedManual"
+        )
         val heightBefore = TextKeyboard.currentLayoutHeightPercentOverride()
         clearAllLayerOverrides()
         currentKeyboard?.onInputMethodUpdate(ime)
@@ -588,7 +601,9 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     // 1) the keyboard window was newly attached
     // 2) currently keyboard window is attached and switchLayout was used
     private fun notifyBarLayoutChanged() {
-        bar.onKeyboardLayoutSwitched(currentKeyboardName == NumberKeyboard.Name)
+        bar.onKeyboardLayoutSwitched(
+            currentKeyboardName == NumberKeyboard.Name || TextKeyboard.isNumericLayoutShowing()
+        )
     }
 
     fun updateBounds() {
