@@ -177,13 +177,6 @@ class MainActivity : AppCompatActivity() {
         needNotifications = grantResults.getOrNull(0) == PackageManager.PERMISSION_GRANTED
     }
 
-    override fun onStop() {
-        viewModel.fcitx.runIfReady {
-            save()
-        }
-        super.onStop()
-    }
-
     companion object {
         const val EXTRA_SETTINGS_ROUTE = "${BuildConfig.APPLICATION_ID}.EXTRA_SETTINGS_ROUTE"
     }
