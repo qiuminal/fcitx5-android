@@ -28,6 +28,7 @@ import org.fcitx.fcitx5.android.data.theme.IconThemeManager
 import org.fcitx.fcitx5.android.input.dependency.fcitx
 import org.fcitx.fcitx5.android.input.dependency.inputMethodService
 import org.fcitx.fcitx5.android.input.dependency.theme
+import org.fcitx.fcitx5.android.input.font.FontProviders
 import org.fcitx.fcitx5.android.input.picker.PickerWindow
 import org.fcitx.fcitx5.android.input.popup.PopupActionListener
 import org.fcitx.fcitx5.android.input.popup.PopupComponent
@@ -112,6 +113,8 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     private var oneShotLayerKey: String? = null
     private val layerHistory = ArrayDeque<String>()
     private var noConfigAuxBarFallbackActive = false
+    private var fontRefreshPending = false
+    private var fontRefreshToken = 0L
     private var companionHeightPercentOverride: Int? = null
     private var companionHeightPxOverride: Int? = null
 
@@ -167,13 +170,34 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
      * Call this when keyboard is about to show.
      */
     fun checkAndApplyFontRefresh() {
-        if (org.fcitx.fcitx5.android.input.font.FontProviders.checkAndClearRefreshFlag()) {
-            // The refresh flag is consumed above, so the rows cache would otherwise
-            // reuse rows built with the previous font set. Clear it first so
-            // refreshAllKeyboards() rebuilds rows and re-applies configured fonts.
+        if (FontProviders.checkAndClearRefreshFlag()) {
+            // Keep the visible keyboard intact until the new font cache is ready. Rebuilding
+            // immediately would force cache-miss lookups onto the first input frame.
             keyboards.values.forEach { it.clearReusableRowsCache() }
-            refreshAllKeyboards()
+            preloadFontsForKeyboard()
         }
+    }
+
+    private fun preloadFontsForKeyboard() {
+        val refreshToken = fontRefreshToken
+        FontProviders.preloadFontsAsync {
+            ContextCompat.getMainExecutor(service).execute {
+                if (refreshToken != fontRefreshToken) return@execute
+                fontRefreshPending = true
+                applyPendingFontRefresh()
+            }
+        }
+    }
+
+    private fun invalidateFontRefresh() {
+        fontRefreshToken++
+        fontRefreshPending = false
+    }
+
+    private fun applyPendingFontRefresh() {
+        if (!fontRefreshPending || !::keyboardView.isInitialized || !keyboardView.isAttachedToWindow) return
+        fontRefreshPending = false
+        refreshCurrentKeyboard()
     }
 
     private val keyActionListener = KeyActionListener { it, source ->
@@ -204,6 +228,7 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
         TextKeyboard.ime = fcitx.runImmediately { inputMethodEntryCached }
         keyboardView = context.frameLayout(R.id.keyboard_view)
         attachLayout(TextKeyboard.Name)
+        preloadFontsForKeyboard()
         Log.i(
             "FcitxColdStart",
             "KeyboardWindow.onCreateView duration=${SystemClock.elapsedRealtime() - startedAt}ms"
@@ -447,6 +472,7 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     }
 
     override fun onStartInput(info: EditorInfo, capFlags: CapabilityFlags) {
+        invalidateFontRefresh()
         // Clear latched/one-shot layer state and the BACK layer history; the forced layout
         // slot is updated in one pass by TextKeyboard.setNumericLayoutKey below.
         latchedLayerKey = null
@@ -532,6 +558,8 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
             }
             it.onAttach()
         }
+        applyPendingFontRefresh()
+        keyboardView.post { applyPendingFontRefresh() }
         applyAuxActions(lastAuxActions)
         notifyBarLayoutChanged()
         service.inputView?.requestBlurRefresh(retryFrames = 8)
@@ -544,6 +572,7 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     }
 
     override fun onDetached() {
+        invalidateFontRefresh()
         IconThemeManager.removeOnChangedListener(iconThemeListener)
         currentKeyboard?.let {
             it.onDetach()

@@ -29,6 +29,7 @@ object FontProviders {
             }
         }
 
+    private val refreshLock = Any()
     @Volatile
     private var needsRefresh = false
     private val fontSizeResultCache = HashMap<String, Float>()
@@ -48,7 +49,9 @@ object FontProviders {
         synchronized(fontSizeResultCache) {
             fontSizeResultCache.clear()
         }
-        needsRefresh = true
+        synchronized(refreshLock) {
+            needsRefresh = true
+        }
     }
 
     /**
@@ -60,17 +63,19 @@ object FontProviders {
         synchronized(fontSizeResultCache) {
             fontSizeResultCache.clear()
         }
-        needsRefresh = true
+        synchronized(refreshLock) {
+            needsRefresh = true
+        }
     }
 
     /**
      * Check and clear refresh flag. Call when keyboard loads.
      * @return true if font changed and keyboard needs refresh
      */
-    fun checkAndClearRefreshFlag(): Boolean {
-        if (!needsRefresh) return false
+    fun checkAndClearRefreshFlag(): Boolean = synchronized(refreshLock) {
+        val result = needsRefresh
         needsRefresh = false
-        return true
+        result
     }
 
     fun clearCache() {
@@ -78,7 +83,9 @@ object FontProviders {
         synchronized(fontSizeResultCache) {
             fontSizeResultCache.clear()
         }
-        needsRefresh = true
+        synchronized(refreshLock) {
+            needsRefresh = true
+        }
     }
 
     val fontTypefaceMap: MutableMap<String, Typeface?>
@@ -113,7 +120,12 @@ object FontProviders {
             else -> default
         }
         synchronized(fontSizeResultCache) {
-            fontSizeResultCache[cacheKey] = resolved
+            // The default provider loads font sizes asynchronously. Do not retain a
+            // fallback calculated from its temporary empty map, or it can mask the
+            // configured value after preload completes.
+            if (sizeMap.isNotEmpty()) {
+                fontSizeResultCache[cacheKey] = resolved
+            }
         }
         return resolved
     }
@@ -135,11 +147,16 @@ object FontProviders {
      * Preload fonts asynchronously. Call this before keyboard is shown.
      */
     fun preloadFontsAsync(onComplete: ((MutableMap<String, Typeface?>) -> Unit)? = null) {
+        val completion: (MutableMap<String, Typeface?>) -> Unit = { fonts ->
+            synchronized(fontSizeResultCache) {
+                fontSizeResultCache.clear()
+            }
+            onComplete?.invoke(fonts)
+        }
         if (provider is DefaultFontProvider) {
-            (provider as DefaultFontProvider).preloadFontsAsync(onComplete)
+            (provider as DefaultFontProvider).preloadFontsAsync(completion)
         } else {
-            // For other providers, just return cached map immediately
-            onComplete?.invoke(fontTypefaceMap)
+            completion(fontTypefaceMap)
         }
     }
 

@@ -11,6 +11,10 @@ import org.fcitx.fcitx5.android.input.config.ConfigProviders
 import java.io.File
 
 class DefaultFontProvider : FontProviderApi {
+    private companion object {
+        const val CONFIG_READ_RETRY_DELAY_MS = 1_000L
+    }
+
     private data class FontConfig(
         val paths: Map<String, List<String>>,
         val fontsDir: File
@@ -18,20 +22,32 @@ class DefaultFontProvider : FontProviderApi {
 
     @Volatile
     private var cachedFontConfig: FontConfig? = null
+    @Volatile
+    private var fontConfigRead = false
+    private var nextFontConfigReadAt = 0L
     private val cachedFontTypefaceMap = mutableMapOf<String, Typeface?>()
     private val cachedTypefaceByPaths = mutableMapOf<List<String>, Typeface?>()
+    private val retryableFontKeys = mutableSetOf<String>()
     @Volatile
     private var cachedFontSizeMap: MutableMap<String, Float>? = null
     @Volatile
     private var isLoading = false
+    private var preloadPending = false
+    private var cacheGeneration = 0L
+    private val preloadCallbacks = mutableListOf<(MutableMap<String, Typeface?>) -> Unit>()
 
     override fun clearCache() {
         synchronized(this) {
+            cacheGeneration++
+            if (isLoading) preloadPending = true
             cachedFontConfig = null
+            fontConfigRead = false
+            nextFontConfigReadAt = 0L
             cachedFontTypefaceMap.clear()
             cachedTypefaceByPaths.clear()
+            retryableFontKeys.clear()
             cachedFontSizeMap = null
-            isLoading = false
+            // The in-flight worker will observe the generation change before publishing.
         }
     }
 
@@ -40,93 +56,169 @@ class DefaultFontProvider : FontProviderApi {
      * Call this when keyboard is about to show.
      */
     fun preloadFontsAsync(onComplete: ((MutableMap<String, Typeface?>) -> Unit)? = null) {
-        synchronized(this) {
-            if (isLoading) return
+        val generation = synchronized(this) {
+            if (isLoading) {
+                onComplete?.let(preloadCallbacks::add)
+                preloadPending = true
+                return
+            }
+            if ((fontConfigRead && retryableFontKeys.isEmpty()) ||
+                SystemClock.elapsedRealtime() < nextFontConfigReadAt
+            ) return
+            onComplete?.let(preloadCallbacks::add)
             isLoading = true
+            cacheGeneration
         }
 
         Thread({
             Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
             val startedAt = SystemClock.elapsedRealtime()
-            val keys = synchronized(this) {
-                loadFontConfigLocked()?.paths?.keys
-                    ?.filterNot { it.endsWith("_size") }
-                    .orEmpty()
-            }
-            keys.forEach { key ->
-                synchronized(this) {
-                    loadFontConfigLocked()?.let { loadTypefaceLocked(key, it) }
+            try {
+                val (activeGeneration, config) = fontConfigSnapshot()
+                val keys = config?.paths?.keys?.filterNot { it.endsWith("_size") }.orEmpty()
+                if (activeGeneration != generation) return@Thread
+                cacheFontSizes(config, activeGeneration)
+                config?.let { fontConfig ->
+                    keys.forEach { key ->
+                        loadTypeface(key, fontConfig, activeGeneration)
+                    }
                 }
+                val completion = synchronized(this) {
+                    if (cacheGeneration != generation) {
+                        null
+                    } else {
+                        preloadCallbacks.toList().also { preloadCallbacks.clear() } to
+                            cachedFontTypefaceMap.toMutableMap()
+                    }
+                }
+                if (completion != null) {
+                    val (callbacks, fonts) = completion
+                    Log.i(
+                        "FcitxColdStart",
+                        "font preload keys=${keys.size} duration=${SystemClock.elapsedRealtime() - startedAt}ms"
+                    )
+                    callbacks.forEach { it(fonts) }
+                }
+            } finally {
+                val retry = synchronized(this) {
+                    val shouldRetry = preloadPending && cacheGeneration != generation
+                    preloadPending = false
+                    isLoading = false
+                    shouldRetry
+                }
+                if (retry) preloadFontsAsync()
             }
-            val fonts = synchronized(this) {
-                isLoading = false
-                cachedFontTypefaceMap.toMutableMap()
-            }
-            Log.i(
-                "FcitxColdStart",
-                "font preload keys=${keys.size} duration=${SystemClock.elapsedRealtime() - startedAt}ms"
-            )
-            onComplete?.invoke(fonts)
         }, "FcitxFontPreload").start()
     }
 
     override val fontTypefaceMap: MutableMap<String, Typeface?>
         get() {
-            return synchronized(this) {
-                val config = loadFontConfigLocked() ?: return@synchronized mutableMapOf()
-                config.paths.keys
-                    .filterNot { it.endsWith("_size") }
-                    .forEach { loadTypefaceLocked(it, config) }
-                cachedFontTypefaceMap.toMutableMap()
-            }
+            requestPreloadIfNeeded()
+            return synchronized(this) { cachedFontTypefaceMap.toMutableMap() }
         }
 
-    override fun resolveTypeface(key: String, current: Typeface?): Typeface = synchronized(this) {
-        val config = loadFontConfigLocked()
-        val resolved = config?.let { loadTypefaceLocked(key, it) }
-            ?: config?.let { loadTypefaceLocked("font", it) }
-        resolved ?: current ?: Typeface.DEFAULT
+    override fun resolveTypeface(key: String, current: Typeface?): Typeface {
+        val resolved = synchronized(this) {
+            cachedFontTypefaceMap[key]
+                ?: cachedFontTypefaceMap["font"]
+        }
+        if (resolved != null) return resolved
+        requestPreloadIfNeeded()
+        return current ?: Typeface.DEFAULT
     }
 
-    private fun loadFontConfigLocked(): FontConfig? {
-        cachedFontConfig?.let { return it }
+    private fun requestPreloadIfNeeded() {
+        val needsPreload = synchronized(this) {
+            (!fontConfigRead || retryableFontKeys.isNotEmpty()) &&
+                !isLoading && SystemClock.elapsedRealtime() >= nextFontConfigReadAt
+        }
+        if (needsPreload) preloadFontsAsync()
+    }
+
+    private fun fontConfigSnapshot(): Pair<Long, FontConfig?> {
+        val generation = synchronized(this) {
+            cachedFontConfig?.let { return cacheGeneration to it }
+            cacheGeneration
+        }
+        val loaded = readFontConfig()
+        return synchronized(this) {
+            if (cacheGeneration != generation) {
+                cacheGeneration to null
+            } else {
+                val config = cachedFontConfig ?: loaded
+                if (config != null) {
+                    cachedFontConfig = config
+                    fontConfigRead = true
+                    nextFontConfigReadAt = 0L
+                } else {
+                    fontConfigRead = false
+                    nextFontConfigReadAt = SystemClock.elapsedRealtime() + CONFIG_READ_RETRY_DELAY_MS
+                }
+                generation to config
+            }
+        }
+    }
+
+    private fun readFontConfig(): FontConfig? {
         val snapshot = ConfigProviders.readFontsetPathMapSnapshot().getOrNull() ?: return null
         val fontsDir = snapshot.file?.parentFile ?: return null
-        return FontConfig(snapshot.value, fontsDir).also { cachedFontConfig = it }
+        return FontConfig(snapshot.value, fontsDir)
     }
 
-    private fun loadTypefaceLocked(key: String, config: FontConfig): Typeface? {
-        if (cachedFontTypefaceMap.containsKey(key)) return cachedFontTypefaceMap[key]
-
-        val validPaths = config.paths[key].orEmpty()
+    private fun loadTypeface(key: String, config: FontConfig, generation: Long): Typeface? {
+        val configuredPaths = config.paths[key].orEmpty()
             .map { it.trim() }
+            .filter { it.isNotEmpty() }
+        val validPaths = configuredPaths
             .map { File(config.fontsDir, it) }
             .filter(File::exists)
             .map(File::getAbsolutePath)
-        val typeface = if (cachedTypefaceByPaths.containsKey(validPaths)) {
-            cachedTypefaceByPaths[validPaths]
-        } else {
-            val startedAt = SystemClock.elapsedRealtime()
-            val loaded = runCatching {
-                when {
-                    validPaths.isEmpty() -> null
-                    validPaths.size == 1 || android.os.Build.VERSION.SDK_INT < 29 ->
-                        Typeface.createFromFile(validPaths.first())
-                    else -> buildCustomFallbackTypeface(validPaths)
+
+        if (configuredPaths.isNotEmpty() && validPaths.isEmpty()) {
+            synchronized(this) {
+                if (cacheGeneration == generation) {
+                    retryableFontKeys.add(key)
+                    nextFontConfigReadAt = SystemClock.elapsedRealtime() + CONFIG_READ_RETRY_DELAY_MS
                 }
-            }.getOrNull()
-            cachedTypefaceByPaths[validPaths] = loaded
-            if (validPaths.isNotEmpty()) {
-                Log.i(
-                    "FcitxColdStart",
-                    "font key=$key files=${validPaths.size} loaded=${loaded != null} " +
-                        "duration=${SystemClock.elapsedRealtime() - startedAt}ms"
-                )
             }
-            loaded
+            return null
         }
-        cachedFontTypefaceMap[key] = typeface
-        return typeface
+
+        synchronized(this) {
+            if (cacheGeneration != generation) return null
+            if (cachedFontTypefaceMap.containsKey(key)) return cachedFontTypefaceMap[key]
+            if (cachedTypefaceByPaths.containsKey(validPaths)) {
+                val cached = cachedTypefaceByPaths[validPaths]
+                cachedFontTypefaceMap[key] = cached
+                return cached
+            }
+        }
+
+        val startedAt = SystemClock.elapsedRealtime()
+        val loaded = runCatching {
+            when {
+                validPaths.isEmpty() -> null
+                validPaths.size == 1 || android.os.Build.VERSION.SDK_INT < 29 ->
+                    Typeface.createFromFile(validPaths.first())
+                else -> buildCustomFallbackTypeface(validPaths)
+            }
+        }.getOrNull()
+
+        synchronized(this) {
+            if (cacheGeneration != generation) return null
+            cachedTypefaceByPaths[validPaths] = loaded
+            cachedFontTypefaceMap[key] = loaded
+            retryableFontKeys.remove(key)
+            if (retryableFontKeys.isEmpty()) nextFontConfigReadAt = 0L
+        }
+        if (validPaths.isNotEmpty()) {
+            Log.i(
+                "FcitxColdStart",
+                "font key=$key files=${validPaths.size} loaded=${loaded != null} " +
+                    "duration=${SystemClock.elapsedRealtime() - startedAt}ms"
+            )
+        }
+        return loaded
     }
 
     @androidx.annotation.RequiresApi(29)
@@ -148,35 +240,23 @@ class DefaultFontProvider : FontProviderApi {
 
     override val fontSizeMap: MutableMap<String, Float>
         get() {
-            // Fast path: lock-free volatile read.
-            val cached = cachedFontSizeMap
-            if (cached != null) return cached
-            return synchronized(this) { loadSizeMapLocked() }
-        }
-
-    private fun loadSizeMapLocked(): MutableMap<String, Float> {
-        val recheck = cachedFontSizeMap
-        if (recheck != null) return recheck
-
-        val snapshot = ConfigProviders
-            .readFontsetPathMapSnapshot()
-            .getOrNull() ?: run {
-            cachedFontSizeMap = null
+            cachedFontSizeMap?.let { return it }
+            requestPreloadIfNeeded()
             return mutableMapOf()
         }
-        cachedFontSizeMap = runCatching {
-            snapshot.value
-                .filterKeys { it.endsWith("_size") }
-                .mapValues { (_, values) ->
-                    runCatching {
-                        values.firstOrNull()?.trim()
-                            ?.toFloatOrNull()?.coerceIn(8f, 72f)
-                    }.getOrNull()
-                }
-                .filterValues { it != null }
-                .mapValues { it.value!! }
-                .toMutableMap()
-        }.getOrElse { mutableMapOf() }
-        return cachedFontSizeMap ?: mutableMapOf()
+
+    private fun cacheFontSizes(config: FontConfig?, generation: Long) {
+        val sizes = config?.paths
+            ?.filterKeys { it.endsWith("_size") }
+            ?.mapValues { (_, values) ->
+                values.firstOrNull()?.trim()?.toFloatOrNull()?.coerceIn(8f, 72f)
+            }
+            ?.filterValues { it != null }
+            ?.mapValues { it.value!! }
+            ?.toMutableMap()
+            ?: mutableMapOf()
+        synchronized(this) {
+            if (cacheGeneration == generation) cachedFontSizeMap = sizes
+        }
     }
 }
