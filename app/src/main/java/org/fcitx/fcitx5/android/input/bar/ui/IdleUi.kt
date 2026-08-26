@@ -82,19 +82,14 @@ class IdleUi(
 
     private val hasCustomMenuIcon get() = toolbarToggleConfig.icon != null || !toolbarToggleConfig.text.isNullOrEmpty()
     private var hideKeyboardInVoiceInputMode = false
-    private val menuButtonRotation
-        get() = when {
-            inPrivate -> 0f
-            currentState == State.Toolbar -> 90f * translateDirection
-            else -> -90f * translateDirection
-        }
+    private val menuButtonRotation = 0f
 
     @DrawableRes
-    private val defaultMenuIcon = R.drawable.ic_baseline_expand_more_24
+    private val defaultMenuIcon = R.drawable.ic_baseline_more_horiz_24
     @DrawableRes
     private val defaultHideKeyboardIcon = R.drawable.ic_baseline_arrow_drop_down_24
 
-    val menuButton = ToolButton(ctx, R.drawable.ic_baseline_expand_more_24, theme).apply {
+    val menuButton = ToolButton(ctx, R.drawable.ic_baseline_more_horiz_24, theme).apply {
         iconRotation = menuButtonRotation
         applySystemButtonConfig(this, toolbarToggleConfig, defaultMenuIcon)
     }
@@ -321,8 +316,7 @@ class IdleUi(
         if (!toolbarToggleConfig.label.isNullOrEmpty()) return
         menuButton.contentDescription = when {
             inPrivate -> ctx.getString(R.string.private_mode)
-            currentState == State.Toolbar -> ctx.getString(R.string.hide_toolbar)
-            else -> ctx.getString(R.string.expand_toolbar)
+            else -> ctx.getString(R.string.status_area)
         }
     }
 
