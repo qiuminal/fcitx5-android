@@ -364,9 +364,11 @@ object VoiceInputProviderManager {
 
         val callback = object : IVoiceInputCallback.Stub() {
             override fun onReady() {
+                if (voiceSessionTerminalized) return
                 logI("provider ready")
                 sessionReady = true
                 service.lifecycleScope.launch {
+                    if (voiceSessionTerminalized) return@launch
                     onProviderReady(service, onLevel, onError)
                     onReady()
                 }
@@ -377,10 +379,12 @@ object VoiceInputProviderManager {
             }
 
             override fun onPartialResult(text: String?) {
+                if (voiceSessionTerminalized) return
                 val t = text.orEmpty()
                 if (t.isNotBlank()) {
                     logI("partial result len=${t.length}: $t")
                     service.lifecycleScope.launch {
+                        if (voiceSessionTerminalized) return@launch
                         service.setVoiceComposingText(t)
                         onPartialResult(t)
                     }
@@ -388,18 +392,26 @@ object VoiceInputProviderManager {
             }
 
             override fun onSegmentFinal(text: String?) {
+                if (voiceSessionTerminalized) return
                 val t = text.orEmpty()
                 if (t.isNotBlank()) {
                     logI("segment final len=${t.length}: $t")
                     tlogI("Voice segment final: $t")
-                    service.lifecycleScope.launch { service.commitText(t) }
+                    service.lifecycleScope.launch {
+                        if (voiceSessionTerminalized) return@launch
+                        service.commitVoiceText(t)
+                    }
                 } else {
                     logI("segment final blank")
-                    service.lifecycleScope.launch { service.clearVoiceComposingText() }
+                    service.lifecycleScope.launch {
+                        if (voiceSessionTerminalized) return@launch
+                        service.clearVoiceComposingText()
+                    }
                 }
             }
 
             override fun onSessionEnded() {
+                if (voiceSessionTerminalized) return
                 logI("provider session ended")
                 tlogI("Voice provider session ended")
                 // Any partial that wasn't followed by a final (e.g. provider
@@ -413,6 +425,7 @@ object VoiceInputProviderManager {
             }
 
             override fun onError(code: Int, message: String?) {
+                if (voiceSessionTerminalized) return
                 logW("provider error $code: $message")
                 Timber.w("Voice provider error $code: $message")
                 service.lifecycleScope.launch {

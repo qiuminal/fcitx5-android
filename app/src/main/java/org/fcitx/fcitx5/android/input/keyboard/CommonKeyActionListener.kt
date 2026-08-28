@@ -234,7 +234,12 @@ class CommonKeyActionListener :
                 }
                 is VoiceInputHoldEnd -> {
                     if (voiceHoldActive) {
-                        switchToVoiceInput()
+                        // Only stop an active session. If it already ended (e.g. the user
+                        // tapped send in a chat app and the IME interrupted it), releasing
+                        // the space key must not start a brand-new dictation session.
+                        if (VoiceInputProviderManager.isActive()) {
+                            switchToVoiceInput()
+                        }
                         voiceHoldActive = false
                     }
                 }

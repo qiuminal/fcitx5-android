@@ -266,6 +266,10 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
     private val composing = CursorRange()
     private var composingText = FormattedText.Empty
 
+    // Voice-input bookkeeping used to detect an external send event.
+    private var voiceComposingActive = false
+    private var voiceCommittedEnd = -1
+
     private fun resetComposingState() {
         composing.clear()
         composingText = FormattedText.Empty
@@ -721,6 +725,9 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
     }
 
     private fun handleReturnKey() {
+        // Enter/return usually sends the message in chat apps; interrupt dictation
+        // so the still-running ASR session cannot re-commit the sent text.
+        interruptVoiceInputOnSend()
         val ic = currentInputConnection ?: run {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
             return
@@ -814,6 +821,8 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         )
         composing.update(start, start + text.length)
         composingText = formatted
+        voiceComposingActive = true
+        voiceCommittedEnd = -1
         selection.predict(composing.end)
         ic.setComposingText(formatted.toSpannedString(highlightColor), 1)
         android.util.Log.i(
@@ -826,6 +835,7 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         val ic = currentInputConnection ?: return
         if (composing.isEmpty()) return
         resetComposingState()
+        voiceComposingActive = false
         ic.setComposingText("", 1)
     }
 
@@ -837,12 +847,68 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
             "voice commit len=${text.length} composing=${composing.isNotEmpty()} same=${composingText.toString() == text}",
         )
         if (composing.isNotEmpty() && composingText.toString() == text) {
-            selection.predict(composing.start + text.length)
+            val end = composing.start + text.length
+            selection.predict(end)
             resetComposingState()
+            voiceComposingActive = false
+            voiceCommittedEnd = end
             ic.finishComposingText()
         } else {
             clearVoiceComposingText()
+            val start = selection.latest.start
             commitText(text)
+            voiceComposingActive = false
+            voiceCommittedEnd = start + text.length
+        }
+    }
+
+    /**
+     * Stop dictation because the target app consumed or cleared the voice text
+     * (e.g. the user tapped the send button in a chat app) or triggered an editor
+     * action. The still-running ASR session must not stream further partials or
+     * finals into the field, otherwise the already-sent message would re-appear.
+     */
+    private fun interruptVoiceInputOnSend() {
+        if (!VoiceInputProviderManager.isActive()) return
+        android.util.Log.i("FcitxVoiceInput", "interrupt voice input on send")
+        // Drop any composing text that may have been (re-)applied after the app
+        // cleared the field, so a stale partial cannot leave ghost text behind.
+        // If the app already finished the composing region this is a harmless no-op
+        // for the committed text. Also clear the local composing state so later
+        // typing does not reuse a stale composing range.
+        if (voiceComposingActive && composing.isNotEmpty()) {
+            clearVoiceComposingText()
+        } else {
+            resetComposingState()
+        }
+        voiceComposingActive = false
+        voiceCommittedEnd = -1
+        VoiceInputProviderManager.stop(this)
+        // The keyboard stays open after sending; hide the listening status.
+        VoiceInputProviderManager.voiceFinishedCallback?.invoke()
+    }
+
+    private fun maybeInterruptVoiceInputOnExternalChange(
+        newSelStart: Int,
+        newSelEnd: Int,
+        candidatesStart: Int,
+        candidatesEnd: Int,
+    ) {
+        if (!VoiceInputProviderManager.isActive()) return
+        // The app committed or removed our composing text (candidates region gone)
+        // while a voice partial was still composing - e.g. it tapped send.
+        if (voiceComposingActive && composing.isNotEmpty() &&
+            candidatesStart == -1 && candidatesEnd == -1
+        ) {
+            interruptVoiceInputOnSend()
+            return
+        }
+        // The app emptied the field after a voice final segment was already
+        // committed - the message was sent and the input box cleared.
+        if (!voiceComposingActive && composing.isEmpty() && voiceCommittedEnd > 0 &&
+            newSelStart == 0 && newSelEnd == 0
+        ) {
+            interruptVoiceInputOnSend()
         }
     }
 
@@ -1500,6 +1566,8 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
             MainService.startSyncService(this, "ime-start-input", imeSyncActive = true)
             selection.resetTo(attribute.initialSelStart, attribute.initialSelEnd)
             resetComposingState()
+            voiceComposingActive = false
+            voiceCommittedEnd = -1
             val flags = CapabilityFlags.fromEditorInfo(attribute)
             capabilityFlags = flags
             inputDeviceManager.notifyOnStartInput(attribute)
@@ -1562,6 +1630,13 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         }
     }
 
+    override fun onEditorAction(actionCode: Int): Boolean {
+        // Chat apps may trigger the send action through performEditorAction; stop
+        // dictation so the session cannot re-commit the already-sent message.
+        interruptVoiceInputOnSend()
+        return super.onEditorAction(actionCode)
+    }
+
     private fun ensurePreferredVoiceInputProviderAvailable() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && !userManager.isUserUnlocked) return
         val keyboardPrefs = AppPrefs.getInstance().keyboard
@@ -1585,6 +1660,12 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         // onUpdateSelection can left behind when user types quickly enough, eg. long press backspace
         cursorUpdateIndex += 1
         Timber.d("onUpdateSelection: old=[$oldSelStart,$oldSelEnd] new=[$newSelStart,$newSelEnd] cand=[$candidatesStart,$candidatesEnd]")
+        maybeInterruptVoiceInputOnExternalChange(
+            newSelStart,
+            newSelEnd,
+            candidatesStart,
+            candidatesEnd,
+        )
         handleCursorUpdate(
             newSelStart,
             newSelEnd,
