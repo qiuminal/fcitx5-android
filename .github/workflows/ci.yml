@@ -134,10 +134,6 @@ jobs:
 
   nightly_release:
     needs: build_commit
-    # Only publish a nightly release when the APKs are signed. An unsigned
-    # release cannot be installed by users and only causes confusion, so it
-    # must never be published. Artifacts are still uploaded per build.
-    if: ${{ secrets.SIGNING_KEY != '' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Fetch source code
@@ -180,6 +176,20 @@ jobs:
           mkdir -p final-release
           find release-artifacts -name "*.apk" -exec cp {} final-release/ \;
 
+      - name: Check APKs are signed
+        id: signed_check
+        shell: bash
+        run: |
+          # Unsigned APKs cannot be installed by users; never publish them as
+          # a release (the build artifacts are still available in workflow runs).
+          if ls final-release/*-unsigned*.apk >/dev/null 2>&1; then
+            echo "signed=false"
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=true"
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Generate nightly tag
         id: tag
         run: echo "value=nightly-$(git describe --tags --long)-$(date -u +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
@@ -207,6 +217,7 @@ jobs:
           cat release_notes.md
 
       - name: Create Nightly release
+        if: steps.signed_check.outputs.signed == 'true'
         uses: softprops/action-gh-release@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
