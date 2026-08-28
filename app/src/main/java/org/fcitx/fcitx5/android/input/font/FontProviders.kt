@@ -28,6 +28,19 @@ interface FontProviderApi {
 }
 
 object FontProviders {
+    /**
+     * Font key for the candidate comment (e.g. Zhuyin / shape-code breakdown).
+     * Comments are usually longer than the candidate text itself, so they get
+     * their own typeface and a smaller size (see [DEFAULT_COMMENT_FONT_SIZE]).
+     */
+    const val KEY_COMMENT_FONT = "comment_font"
+
+    /**
+     * Default comment font size in sp. Smaller than the candidate font size
+     * so long comments stay readable without dominating the candidate bar.
+     */
+    const val DEFAULT_COMMENT_FONT_SIZE = 14f
+
     @Volatile
     var provider: FontProviderApi = DefaultFontProvider()
         set(value) {
