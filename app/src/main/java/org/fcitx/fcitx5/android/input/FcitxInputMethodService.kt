@@ -1630,11 +1630,11 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         }
     }
 
-    override fun onEditorAction(actionCode: Int): Boolean {
+    override fun onEditorAction(attribute: EditorInfo, event: KeyEvent): Boolean {
         // Chat apps may trigger the send action through performEditorAction; stop
         // dictation so the session cannot re-commit the already-sent message.
         interruptVoiceInputOnSend()
-        return super.onEditorAction(actionCode)
+        return super.onEditorAction(attribute, event)
     }
 
     private fun ensurePreferredVoiceInputProviderAvailable() {
