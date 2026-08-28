@@ -134,6 +134,10 @@ jobs:
 
   nightly_release:
     needs: build_commit
+    # Only publish a nightly release when the APKs are signed. An unsigned
+    # release cannot be installed by users and only causes confusion, so it
+    # must never be published. Artifacts are still uploaded per build.
+    if: ${{ secrets.SIGNING_KEY != '' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Fetch source code
