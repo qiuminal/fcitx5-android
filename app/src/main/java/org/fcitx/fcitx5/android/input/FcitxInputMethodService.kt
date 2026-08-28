@@ -727,7 +727,7 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
     private fun handleReturnKey() {
         // Enter/return usually sends the message in chat apps; interrupt dictation
         // so the still-running ASR session cannot re-commit the sent text.
-        interruptVoiceInputOnSend()
+        interruptVoiceInputOnSend("handleReturnKey")
         val ic = currentInputConnection ?: run {
             sendDownUpKeyEvents(KeyEvent.KEYCODE_ENTER)
             return
@@ -864,25 +864,34 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
 
     /**
      * Stop dictation because the target app consumed or cleared the voice text
-     * (e.g. the user tapped the send button in a chat app) or triggered an editor
-     * action. The still-running ASR session must not stream further partials or
-     * finals into the field, otherwise the already-sent message would re-appear.
+     * (e.g. the user tapped the send button in a chat app), the input session
+     * was restarted/ended, or the return key was pressed. The still-running ASR
+     * session must not stream further partials or finals into the field,
+     * otherwise the already-sent message would re-appear.
      */
-    private fun interruptVoiceInputOnSend() {
-        if (!VoiceInputProviderManager.isActive()) return
-        android.util.Log.i("FcitxVoiceInput", "interrupt voice input on send")
+    private fun interruptVoiceInputOnSend(reason: String, clearComposing: Boolean = true) {
+        val active = VoiceInputProviderManager.isActive()
+        if (!active && !voiceComposingActive && voiceCommittedEnd <= 0) {
+            android.util.Log.i("FcitxVoiceInput", "interrupt skipped (idle) reason=$reason")
+            return
+        }
+        android.util.Log.i("FcitxVoiceInput", "interrupt voice input reason=$reason active=$active")
         // Drop any composing text that may have been (re-)applied after the app
         // cleared the field, so a stale partial cannot leave ghost text behind.
         // If the app already finished the composing region this is a harmless no-op
         // for the committed text. Also clear the local composing state so later
         // typing does not reuse a stale composing range.
-        if (voiceComposingActive && composing.isNotEmpty()) {
+        val hadVoiceComposing = voiceComposingActive && composing.isNotEmpty()
+        // Reset bookkeeping before touching the input connection: setComposingText
+        // below triggers a reentrant onUpdateSelection, which must not re-detect
+        // the send event.
+        voiceComposingActive = false
+        voiceCommittedEnd = -1
+        if (clearComposing && hadVoiceComposing) {
             clearVoiceComposingText()
         } else {
             resetComposingState()
         }
-        voiceComposingActive = false
-        voiceCommittedEnd = -1
         VoiceInputProviderManager.stop(this)
         // The keyboard stays open after sending; hide the listening status.
         VoiceInputProviderManager.voiceFinishedCallback?.invoke()
@@ -894,13 +903,20 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         candidatesStart: Int,
         candidatesEnd: Int,
     ) {
-        if (!VoiceInputProviderManager.isActive()) return
+        val active = VoiceInputProviderManager.isActive()
+        if (!active && !voiceComposingActive && voiceCommittedEnd <= 0) return
+        android.util.Log.i(
+            "FcitxVoiceInput",
+            "onUpdateSelection active=$active voiceComp=$voiceComposingActive " +
+                "composing=${composing.isNotEmpty()} committedEnd=$voiceCommittedEnd " +
+                "new=[$newSelStart,$newSelEnd] cand=[$candidatesStart,$candidatesEnd]",
+        )
         // The app committed or removed our composing text (candidates region gone)
         // while a voice partial was still composing - e.g. it tapped send.
         if (voiceComposingActive && composing.isNotEmpty() &&
             candidatesStart == -1 && candidatesEnd == -1
         ) {
-            interruptVoiceInputOnSend()
+            interruptVoiceInputOnSend("onUpdateSelection-composing-committed")
             return
         }
         // The app emptied the field after a voice final segment was already
@@ -908,7 +924,7 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         if (!voiceComposingActive && composing.isEmpty() && voiceCommittedEnd > 0 &&
             newSelStart == 0 && newSelEnd == 0
         ) {
-            interruptVoiceInputOnSend()
+            interruptVoiceInputOnSend("onUpdateSelection-field-cleared")
         }
     }
 
@@ -1564,6 +1580,13 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
         try {
             val inputSessionGeneration = ++this.inputSessionGeneration
             MainService.startSyncService(this, "ime-start-input", imeSyncActive = true)
+            // A new (or restarted) input session means the previous dictation target is
+            // gone. If a voice session is still listening, interrupt it so it cannot
+            // re-commit into the new/cleared field (e.g. the user tapped send in a chat
+            // app, which typically restarts the input session before clearing the box).
+            if (VoiceInputProviderManager.isActive() || voiceComposingActive) {
+                interruptVoiceInputOnSend("onStartInput restarting=$restarting", clearComposing = false)
+            }
             selection.resetTo(attribute.initialSelStart, attribute.initialSelEnd)
             resetComposingState()
             voiceComposingActive = false
@@ -1957,6 +1980,12 @@ class FcitxInputMethodService : LifecycleInputMethodService() {
 
     override fun onFinishInput() {
         Timber.d("onFinishInput")
+        // The editor session ended (keyboard hidden / field switched / app finished
+        // input). A still-running dictation session has no valid target anymore -
+        // stop it so it cannot re-commit text later.
+        if (VoiceInputProviderManager.isActive() || voiceComposingActive) {
+            interruptVoiceInputOnSend("onFinishInput", clearComposing = false)
+        }
         MainService.stopSyncService(this)
         val inputSessionGeneration = this.inputSessionGeneration
         postFcitxSessionJob(inputSessionGeneration) {
