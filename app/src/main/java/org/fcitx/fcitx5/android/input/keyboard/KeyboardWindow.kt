@@ -114,7 +114,7 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     private val layerHistory = ArrayDeque<String>()
     private var noConfigAuxBarFallbackActive = false
     private var fontRefreshPending = false
-    private var fontRefreshToken = 0L
+    private var lastRefreshedFontGeneration = -1L
     private var companionHeightPercentOverride: Int? = null
     private var companionHeightPxOverride: Int? = null
 
@@ -179,19 +179,21 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     }
 
     private fun preloadFontsForKeyboard() {
-        val refreshToken = fontRefreshToken
         FontProviders.preloadFontsAsync {
             ContextCompat.getMainExecutor(service).execute {
-                if (refreshToken != fontRefreshToken) return@execute
+                // The completion may also fire for reloads that produced identical font
+                // data (e.g. retry ticks while a configured font file is still missing).
+                // Gate on the served-data revision so rows are rebuilt exactly once per
+                // real font change; a stale callback can no longer drop the refresh (the
+                // old token was invalidated by onStartInput running right after
+                // checkAndApplyFontRefresh, which silently killed this path).
+                val generation = FontProviders.fontGeneration
+                if (generation == lastRefreshedFontGeneration) return@execute
+                lastRefreshedFontGeneration = generation
                 fontRefreshPending = true
                 applyPendingFontRefresh()
             }
         }
-    }
-
-    private fun invalidateFontRefresh() {
-        fontRefreshToken++
-        fontRefreshPending = false
     }
 
     private fun applyPendingFontRefresh() {
@@ -475,7 +477,6 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     }
 
     override fun onStartInput(info: EditorInfo, capFlags: CapabilityFlags) {
-        invalidateFontRefresh()
         // Clear latched/one-shot layer state and the BACK layer history; the forced layout
         // slot is updated in one pass by TextKeyboard.setNumericLayoutKey below.
         latchedLayerKey = null
@@ -585,7 +586,6 @@ class KeyboardWindow : InputWindow.SimpleInputWindow<KeyboardWindow>(), Essentia
     }
 
     override fun onDetached() {
-        invalidateFontRefresh()
         IconThemeManager.removeOnChangedListener(iconThemeListener)
         currentKeyboard?.let {
             it.onDetach()

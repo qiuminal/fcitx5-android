@@ -25,7 +25,15 @@ class DefaultFontProvider : FontProviderApi {
     @Volatile
     private var fontConfigRead = false
     private var nextFontConfigReadAt = 0L
-    private val cachedFontTypefaceMap = mutableMapOf<String, Typeface?>()
+
+    // Typefaces currently served to the UI. This map is never emptied while a fontset
+    // reload is in flight: the reload builds a fresh map on the worker thread and swaps
+    // it in atomically once complete. Views created between clearCache() and the swap
+    // therefore keep resolving to the previous custom fonts instead of falling back to
+    // the system default (which used to bake "lost font" rows into the reusable rows
+    // cache when a layout reload happened during the reload window).
+    @Volatile
+    private var servedFontTypefaceMap: MutableMap<String, Typeface?> = mutableMapOf()
     private val cachedTypefaceByPaths = mutableMapOf<List<String>, Typeface?>()
     private val retryableFontKeys = mutableSetOf<String>()
     @Volatile
@@ -34,7 +42,17 @@ class DefaultFontProvider : FontProviderApi {
     private var isLoading = false
     private var preloadPending = false
     private var cacheGeneration = 0L
+
+    // Revision of the served font data. It only changes when the served content actually
+    // changes (a publish with different content, e.g. after a fontset edit or when a
+    // previously missing font file becomes available), so consumers can refresh exactly
+    // once per real change instead of on every preload retry tick.
+    @Volatile
+    private var fontGeneration = 0L
     private val preloadCallbacks = mutableListOf<(MutableMap<String, Typeface?>) -> Unit>()
+
+    override val fontDataVersion: Long
+        get() = fontGeneration
 
     override fun clearCache() {
         synchronized(this) {
@@ -43,11 +61,13 @@ class DefaultFontProvider : FontProviderApi {
             cachedFontConfig = null
             fontConfigRead = false
             nextFontConfigReadAt = 0L
-            cachedFontTypefaceMap.clear()
             cachedTypefaceByPaths.clear()
             retryableFontKeys.clear()
-            cachedFontSizeMap = null
-            // The in-flight worker will observe the generation change before publishing.
+            // servedFontTypefaceMap and cachedFontSizeMap are intentionally kept: they
+            // keep serving the previous custom fonts until the reload publishes their
+            // replacement, so a fontset change never renders the system default font as
+            // an intermediate state. The in-flight worker observes the generation change
+            // before publishing.
         }
     }
 
@@ -56,18 +76,29 @@ class DefaultFontProvider : FontProviderApi {
      * Call this when keyboard is about to show.
      */
     fun preloadFontsAsync(onComplete: ((MutableMap<String, Typeface?>) -> Unit)? = null) {
-        val generation = synchronized(this) {
+        var settledSnapshot: MutableMap<String, Typeface?>? = null
+        val generationOrNull: Long? = synchronized(this) {
             if (isLoading) {
                 onComplete?.let(preloadCallbacks::add)
                 preloadPending = true
-                return
+                null
+            } else if (SystemClock.elapsedRealtime() < nextFontConfigReadAt) {
+                null
+            } else if (fontConfigRead && retryableFontKeys.isEmpty()) {
+                // Already settled: hand the current map to the caller synchronously so a
+                // refresh requester never waits on a load that will never start. The
+                // callback is invoked outside the lock below.
+                settledSnapshot = servedFontTypefaceMap.toMutableMap()
+                null
+            } else {
+                onComplete?.let(preloadCallbacks::add)
+                isLoading = true
+                cacheGeneration
             }
-            if ((fontConfigRead && retryableFontKeys.isEmpty()) ||
-                SystemClock.elapsedRealtime() < nextFontConfigReadAt
-            ) return
-            onComplete?.let(preloadCallbacks::add)
-            isLoading = true
-            cacheGeneration
+        }
+        val generation = generationOrNull ?: run {
+            settledSnapshot?.let { snapshot -> onComplete?.invoke(snapshot) }
+            return
         }
 
         Thread({
@@ -78,21 +109,32 @@ class DefaultFontProvider : FontProviderApi {
                 val keys = config?.paths?.keys?.filterNot { it.endsWith("_size") }.orEmpty()
                 if (activeGeneration != generation) return@Thread
                 cacheFontSizes(config, activeGeneration)
+                // Build the replacement map in isolation; the currently served map stays
+                // untouched so concurrent view creation keeps seeing the old fonts.
+                val fresh = mutableMapOf<String, Typeface?>()
                 config?.let { fontConfig ->
                     keys.forEach { key ->
-                        loadTypeface(key, fontConfig, activeGeneration)
+                        loadTypeface(key, fontConfig, activeGeneration, fresh)
                     }
                 }
-                val completion = synchronized(this) {
-                    if (cacheGeneration != generation) {
-                        null
-                    } else {
-                        preloadCallbacks.toList().also { preloadCallbacks.clear() } to
-                            cachedFontTypefaceMap.toMutableMap()
+                val published: Pair<List<(MutableMap<String, Typeface?>) -> Unit>, MutableMap<String, Typeface?>>? =
+                    synchronized(this) {
+                        if (cacheGeneration != generation) {
+                            null
+                        } else {
+                            if (servedFontTypefaceMap != fresh) {
+                                // Swap before bumping the revision: a reader that sees the
+                                // new revision must never be able to rebuild rows from the
+                                // previous map and cache them under the new revision.
+                                servedFontTypefaceMap = fresh
+                                fontGeneration++
+                            }
+                            preloadCallbacks.toList().also { preloadCallbacks.clear() } to
+                                servedFontTypefaceMap.toMutableMap()
+                        }
                     }
-                }
-                if (completion != null) {
-                    val (callbacks, fonts) = completion
+                if (published != null) {
+                    val (callbacks, fonts) = published
                     Log.i(
                         "FcitxColdStart",
                         "font preload keys=${keys.size} duration=${SystemClock.elapsedRealtime() - startedAt}ms"
@@ -114,13 +156,13 @@ class DefaultFontProvider : FontProviderApi {
     override val fontTypefaceMap: MutableMap<String, Typeface?>
         get() {
             requestPreloadIfNeeded()
-            return synchronized(this) { cachedFontTypefaceMap.toMutableMap() }
+            return synchronized(this) { servedFontTypefaceMap.toMutableMap() }
         }
 
     override fun resolveTypeface(key: String, current: Typeface?): Typeface {
         val resolved = synchronized(this) {
-            cachedFontTypefaceMap[key]
-                ?: cachedFontTypefaceMap["font"]
+            servedFontTypefaceMap[key]
+                ?: servedFontTypefaceMap["font"]
         }
         if (resolved != null) return resolved
         requestPreloadIfNeeded()
@@ -165,7 +207,12 @@ class DefaultFontProvider : FontProviderApi {
         return FontConfig(snapshot.value, fontsDir)
     }
 
-    private fun loadTypeface(key: String, config: FontConfig, generation: Long): Typeface? {
+    private fun loadTypeface(
+        key: String,
+        config: FontConfig,
+        generation: Long,
+        target: MutableMap<String, Typeface?>
+    ): Typeface? {
         val configuredPaths = config.paths[key].orEmpty()
             .map { it.trim() }
             .filter { it.isNotEmpty() }
@@ -186,10 +233,10 @@ class DefaultFontProvider : FontProviderApi {
 
         synchronized(this) {
             if (cacheGeneration != generation) return null
-            if (cachedFontTypefaceMap.containsKey(key)) return cachedFontTypefaceMap[key]
+            if (target.containsKey(key)) return target[key]
             if (cachedTypefaceByPaths.containsKey(validPaths)) {
                 val cached = cachedTypefaceByPaths[validPaths]
-                cachedFontTypefaceMap[key] = cached
+                target[key] = cached
                 return cached
             }
         }
@@ -207,7 +254,7 @@ class DefaultFontProvider : FontProviderApi {
         synchronized(this) {
             if (cacheGeneration != generation) return null
             cachedTypefaceByPaths[validPaths] = loaded
-            cachedFontTypefaceMap[key] = loaded
+            target[key] = loaded
             retryableFontKeys.remove(key)
             if (retryableFontKeys.isEmpty()) nextFontConfigReadAt = 0L
         }

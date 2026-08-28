@@ -11,6 +11,14 @@ interface FontProviderApi {
     val fontTypefaceMap: MutableMap<String, Typeface?>
     val fontSizeMap: MutableMap<String, Float>
 
+    /**
+     * Monotonic revision of the served custom-font data. It changes only when the
+     * resolved fonts actually change (not on every reload attempt), so callers can
+     * rebuild font-dependent views exactly once per real change.
+     */
+    val fontDataVersion: Long
+        get() = 0L
+
     fun resolveTypeface(key: String, current: Typeface? = null): Typeface {
         return fontTypefaceMap[key]
             ?: fontTypefaceMap["font"]
@@ -93,6 +101,12 @@ object FontProviders {
 
     val fontSizeMap: MutableMap<String, Float>
         get() = provider.fontSizeMap
+
+    /**
+     * Revision of the currently served custom-font data; see [FontProviderApi.fontDataVersion].
+     */
+    val fontGeneration: Long
+        get() = provider.fontDataVersion
 
     /**
      * Get font size for a specific key with fallback logic.
